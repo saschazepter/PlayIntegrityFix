@@ -14,7 +14,8 @@ android {
 
     packaging {
         jniLibs {
-            excludes += "**/libdobby.so"
+            excludes += "**/libshadowhook.so"
+            excludes += "**/libshadowhook_nothing.so"
         }
         resources {
             excludes += "**"
@@ -31,6 +32,11 @@ android {
 
         externalNativeBuild {
             cmake {
+                abiFilters(
+                    "arm64-v8a",
+                    "armeabi-v7a"
+                )
+
                 arguments(
                     "-DCMAKE_BUILD_TYPE=MinSizeRel",
                     "-DANDROID_STL=none"
@@ -79,6 +85,7 @@ android {
 dependencies {
     implementation(libs.cxx)
     implementation(libs.hiddenapibypass)
+    implementation(libs.shadowhook)
 }
 
 tasks.register("updateModuleProp") {

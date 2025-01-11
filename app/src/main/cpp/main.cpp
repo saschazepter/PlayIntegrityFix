@@ -1,45 +1,79 @@
+#include "json.hpp"
+#include "shadowhook.h"
+#include "zygisk.hpp"
 #include <android/log.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
-#include "zygisk.hpp"
-#include "dobby.h"
-#include "json.hpp"
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PIF", __VA_ARGS__)
 
-#define DEX_PATH "/data/adb/modules/playintegrityfix/classes.dex"
-
-#define PIF_JSON "/data/adb/pif.json"
-
-#define PIF_JSON_DEFAULT "/data/adb/modules/playintegrityfix/pif.json"
-
-#define TS_PATH "/data/adb/modules/tricky_store"
-
+/**
+ * @brief Reads exactly `count` bytes from the file descriptor `fd` into
+ *        `buffer`, unless EOF is reached first. In case of partial reads
+ *        (e.g. EOF), the function returns the number of bytes actually read.
+ *
+ * @param fd     The file descriptor to read from.
+ * @param buffer Pointer to the destination buffer.
+ * @param count  The total number of bytes to read.
+ * @return The total number of bytes read, or -1 on error.
+ */
 static ssize_t xread(int fd, void *buffer, size_t count) {
-    ssize_t total = 0;
-    char *buf = (char *) buffer;
+    auto *buf = static_cast<char *>(buffer);
+    ssize_t totalRead = 0;
+
     while (count > 0) {
-        ssize_t ret = TEMP_FAILURE_RETRY(read(fd, buf, count));
-        if (ret < 0) return -1;
+        ssize_t ret = TEMP_FAILURE_RETRY(::read(fd, buf, count));
+        if (ret < 0) {
+            // Return -1 if we haven't read anything, otherwise return partial read.
+            return (totalRead > 0) ? totalRead : -1;
+        }
+        if (ret == 0) {
+            // EOF reached
+            break;
+        }
         buf += ret;
-        total += ret;
         count -= ret;
+        totalRead += ret;
     }
-    return total;
+
+    return totalRead;
 }
 
+/**
+ * @brief Writes exactly `count` bytes to the file descriptor `fd` from
+ *        `buffer`. This function blocks until all bytes are written or
+ *        an error occurs.
+ *
+ * @param fd     The file descriptor to write to.
+ * @param buffer Pointer to the source buffer.
+ * @param count  The total number of bytes to write.
+ * @return The total number of bytes written, or -1 on error.
+ */
 static ssize_t xwrite(int fd, const void *buffer, size_t count) {
-    ssize_t total = 0;
-    char *buf = (char *) buffer;
+    auto *buf = static_cast<const char *>(buffer);
+    ssize_t totalWritten = 0;
+
     while (count > 0) {
-        ssize_t ret = TEMP_FAILURE_RETRY(write(fd, buf, count));
-        if (ret < 0) return -1;
+        ssize_t ret = TEMP_FAILURE_RETRY(::write(fd, buf, count));
+        if (ret < 0) {
+            // Return -1 if we haven't written anything, otherwise return partial
+            // write.
+            return (totalWritten > 0) ? totalWritten : -1;
+        }
+        if (ret == 0) {
+            // This is unusual for write(). Typically means the OS can't accept more
+            // data right now. Depending on your use case, you might want to retry,
+            // sleep, or break. Here, we'll simply break to avoid a potential infinite
+            // loop.
+            break;
+        }
         buf += ret;
-        total += ret;
         count -= ret;
+        totalWritten += ret;
     }
-    return total;
+
+    return totalWritten;
 }
 
 static bool DEBUG = false;
@@ -49,9 +83,11 @@ typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 
 static T_Callback o_callback = nullptr;
 
-static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
+static void modify_callback(void *cookie, const char *name, const char *value,
+                            uint32_t serial) {
 
-    if (!cookie || !name || !value || !o_callback) return;
+    if (!cookie || !name || !value || !o_callback)
+        return;
 
     const char *oldValue = value;
 
@@ -76,7 +112,8 @@ static void modify_callback(void *cookie, const char *name, const char *value, u
     }
 
     if (strcmp(oldValue, value) == 0) {
-        if (DEBUG) LOGD("[%s]: %s (unchanged)", name, oldValue);
+        if (DEBUG)
+            LOGD("[%s]: %s (unchanged)", name, oldValue);
     } else {
         LOGD("[%s]: %s -> %s", name, oldValue, value);
     }
@@ -84,18 +121,25 @@ static void modify_callback(void *cookie, const char *name, const char *value, u
     return o_callback(cookie, name, value, serial);
 }
 
-static void (*o_system_property_read_callback)(prop_info *, T_Callback, void *) = nullptr;
+static void (*o_system_property_read_callback)(prop_info *, T_Callback,
+                                               void *) = nullptr;
 
-static void my_system_property_read_callback(prop_info *pi, T_Callback callback, void *cookie) {
-    if (pi && callback && cookie) o_callback = callback;
+static void my_system_property_read_callback(prop_info *pi, T_Callback callback,
+                                             void *cookie) {
+    if (pi && callback && cookie)
+        o_callback = callback;
     return o_system_property_read_callback(pi, modify_callback, cookie);
 }
 
 static bool doHook() {
-    void *ptr = DobbySymbolResolver(nullptr, "__system_property_read_callback");
+    shadowhook_init(SHADOWHOOK_MODE_UNIQUE, true);
 
-    if (ptr && DobbyHook(ptr, (void *) my_system_property_read_callback,
-                         (void **) &o_system_property_read_callback) == 0) {
+    auto ptr = shadowhook_hook_sym_name(
+            "libc.so", "__system_property_read_callback",
+            reinterpret_cast<void *>(my_system_property_read_callback),
+            reinterpret_cast<void **>(&o_system_property_read_callback));
+
+    if (ptr) {
         LOGD("hook __system_property_read_callback successful at %p", ptr);
         return true;
     }
@@ -143,7 +187,8 @@ public:
             return;
         }
 
-        bool isGmsUnstable = std::string_view(name) == "com.google.android.gms.unstable";
+        bool isGmsUnstable =
+                std::string_view(name) == "com.google.android.gms.unstable";
 
         env->ReleaseStringUTFChars(args->nice_name, name);
 
@@ -152,24 +197,16 @@ public:
             return;
         }
 
+        auto gmsDirRaw = env->GetStringUTFChars(args->app_data_dir, nullptr);
+        gmsDir = gmsDirRaw;
+        env->ReleaseStringUTFChars(args->app_data_dir, gmsDirRaw);
+
         int fd = api->connectCompanion();
 
-        int dexSize = 0, jsonSize = 0;
-        std::string jsonStr;
+        auto size = static_cast<uint32_t>(gmsDir.size());
 
-        xread(fd, &dexSize, sizeof(dexSize));
-        xread(fd, &jsonSize, sizeof(jsonSize));
-
-        if (dexSize > 0) {
-            dexVector.resize(dexSize);
-            xread(fd, dexVector.data(), dexSize * sizeof(uint8_t));
-        }
-
-        if (jsonSize > 0) {
-            jsonStr.resize(jsonSize);
-            xread(fd, jsonStr.data(), jsonSize * sizeof(uint8_t));
-            json = nlohmann::json::parse(jsonStr, nullptr, false, true);
-        }
+        xwrite(fd, &size, sizeof(size));
+        xwrite(fd, gmsDir.data(), size);
 
         bool trickyStore = false;
         xread(fd, &trickyStore, sizeof(trickyStore));
@@ -178,11 +215,6 @@ public:
         xread(fd, &testSignedRom, sizeof(testSignedRom));
 
         close(fd);
-
-        LOGD("Dex file size: %d", dexSize);
-        LOGD("Json file size: %d", jsonSize);
-
-        parseJSON();
 
         if (trickyStore) {
             LOGD("TrickyStore module detected!");
@@ -197,14 +229,23 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (dexVector.empty()) return;
+        if (gmsDir.empty())
+            return;
+
+        FILE *f = fopen((gmsDir + "/pif.json").c_str(), "r");
+        if (f) {
+            json = nlohmann::json::parse(f, nullptr, false, true);
+            fclose(f);
+        }
+        parseJSON();
 
         UpdateBuildFields();
 
         if (spoofProvider || spoofSignature) {
             injectDex();
         } else {
-            LOGD("Dex file won't be injected due spoofProvider and spoofSignature are false");
+            LOGD("Dex file won't be injected due spoofProvider and spoofSignature "
+                 "are false");
         }
 
         if (spoofProps) {
@@ -216,8 +257,8 @@ public:
         }
 
         json.clear();
-        dexVector.clear();
-        dexVector.shrink_to_fit();
+        gmsDir.clear();
+        gmsDir.shrink_to_fit();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
@@ -227,7 +268,7 @@ public:
 private:
     zygisk::Api *api = nullptr;
     JNIEnv *env = nullptr;
-    std::vector<uint8_t> dexVector;
+    std::string gmsDir;
     nlohmann::json json;
     bool spoofProps = true;
     bool spoofProvider = true;
@@ -239,13 +280,16 @@ private:
     }
 
     void parseJSON() {
-        if (json.empty()) return;
+        if (json.empty())
+            return;
 
         if (json.contains("DEVICE_INITIAL_SDK_INT")) {
             if (json["DEVICE_INITIAL_SDK_INT"].is_string()) {
-                DEVICE_INITIAL_SDK_INT = json["DEVICE_INITIAL_SDK_INT"].get<std::string>();
+                DEVICE_INITIAL_SDK_INT =
+                        json["DEVICE_INITIAL_SDK_INT"].get<std::string>();
             } else if (json["DEVICE_INITIAL_SDK_INT"].is_number_integer()) {
-                DEVICE_INITIAL_SDK_INT = std::to_string(json["DEVICE_INITIAL_SDK_INT"].get<int>());
+                DEVICE_INITIAL_SDK_INT =
+                        std::to_string(json["DEVICE_INITIAL_SDK_INT"].get<int>());
             } else {
                 LOGE("Couldn't parse DEVICE_INITIAL_SDK_INT value!");
             }
@@ -262,7 +306,8 @@ private:
             json.erase("spoofProps");
         }
 
-        if (json.contains("spoofSignature") && json["spoofSignature"].is_boolean()) {
+        if (json.contains("spoofSignature") &&
+            json["spoofSignature"].is_boolean()) {
             spoofSignature = json["spoofSignature"].get<bool>();
             json.erase("spoofSignature");
         }
@@ -279,7 +324,8 @@ private:
             auto parts = fingerprint | std::views::split('/');
 
             for (const auto &part: parts) {
-                auto subParts = std::string(part.begin(), part.end()) | std::views::split(':');
+                auto subParts =
+                        std::string(part.begin(), part.end()) | std::views::split(':');
                 for (const auto &subPart: subParts) {
                     vector.emplace_back(subPart.begin(), subPart.end());
                 }
@@ -311,9 +357,10 @@ private:
     void injectDex() {
         LOGD("get system classloader");
         auto clClass = env->FindClass("java/lang/ClassLoader");
-        auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader",
-                                                           "()Ljava/lang/ClassLoader;");
-        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+        auto getSystemClassLoader = env->GetStaticMethodID(
+                clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        auto systemClassLoader =
+                env->CallStaticObjectMethod(clClass, getSystemClassLoader);
 
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
@@ -322,12 +369,14 @@ private:
         }
 
         LOGD("create class loader");
-        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-        auto dexClInit = env->GetMethodID(dexClClass, "<init>",
-                                          "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-        auto buffer = env->NewDirectByteBuffer(dexVector.data(),
-                                               static_cast<jlong>(dexVector.size()));
-        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
+        auto dexClClass = env->FindClass("dalvik/system/PathClassLoader");
+        auto dexClInit = env->GetMethodID(
+                dexClClass, "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+        auto str1 = env->NewStringUTF((gmsDir + "/classes.dex").c_str());
+        auto str2 = env->NewStringUTF(gmsDir.c_str());
+        auto dexCl =
+                env->NewObject(dexClClass, dexClInit, str1, str2, systemClassLoader);
 
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
@@ -338,8 +387,10 @@ private:
         LOGD("load class");
         auto loadClass = env->GetMethodID(clClass, "loadClass",
                                           "(Ljava/lang/String;)Ljava/lang/Class;");
-        auto entryClassName = env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPoint");
-        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
+        auto entryClassName =
+                env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPoint");
+        auto entryClassObj =
+                env->CallObjectMethod(dexCl, loadClass, entryClassName);
         auto entryPointClass = (jclass) entryClassObj;
 
         if (env->ExceptionCheck()) {
@@ -349,10 +400,11 @@ private:
         }
 
         LOGD("call init");
-        auto entryInit = env->GetStaticMethodID(entryPointClass, "init", "(Ljava/lang/String;ZZ)V");
+        auto entryInit = env->GetStaticMethodID(entryPointClass, "init",
+                                                "(Ljava/lang/String;ZZ)V");
         auto jsonStr = env->NewStringUTF(json.dump().c_str());
-        env->CallStaticVoidMethod(entryPointClass, entryInit, jsonStr, spoofProvider,
-                                  spoofSignature);
+        env->CallStaticVoidMethod(entryPointClass, entryInit, jsonStr,
+                                  spoofProvider, spoofSignature);
 
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
@@ -363,7 +415,6 @@ private:
         env->DeleteLocalRef(entryClassObj);
         env->DeleteLocalRef(jsonStr);
         env->DeleteLocalRef(dexCl);
-        env->DeleteLocalRef(buffer);
         env->DeleteLocalRef(dexClClass);
         env->DeleteLocalRef(clClass);
 
@@ -375,16 +426,19 @@ private:
         jclass versionClass = env->FindClass("android/os/Build$VERSION");
 
         for (auto &[key, val]: json.items()) {
-            if (!val.is_string()) continue;
+            if (!val.is_string())
+                continue;
 
             const char *fieldName = key.c_str();
 
-            jfieldID fieldID = env->GetStaticFieldID(buildClass, fieldName, "Ljava/lang/String;");
+            jfieldID fieldID =
+                    env->GetStaticFieldID(buildClass, fieldName, "Ljava/lang/String;");
 
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
 
-                fieldID = env->GetStaticFieldID(versionClass, fieldName, "Ljava/lang/String;");
+                fieldID = env->GetStaticFieldID(versionClass, fieldName,
+                                                "Ljava/lang/String;");
 
                 if (env->ExceptionCheck()) {
                     env->ExceptionClear();
@@ -409,22 +463,6 @@ private:
     }
 };
 
-static std::vector<uint8_t> readFile(const char *path) {
-    FILE *file = fopen(path, "rb");
-
-    if (!file) return {};
-
-    int size = static_cast<int>(std::filesystem::file_size(path));
-
-    std::vector<uint8_t> vector(size);
-
-    fread(vector.data(), 1, size, file);
-
-    fclose(file);
-
-    return vector;
-}
-
 static bool checkOtaZip() {
     std::array<char, 128> buffer{};
     std::string result;
@@ -432,7 +470,8 @@ static bool checkOtaZip() {
 
     std::unique_ptr<FILE, decltype(&pclose)> pipe(
             popen("unzip -l /system/etc/security/otacerts.zip", "r"), pclose);
-    if (!pipe) return false;
+    if (!pipe)
+        return false;
 
     while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
         result += buffer.data();
@@ -445,38 +484,76 @@ static bool checkOtaZip() {
     return found;
 }
 
+namespace fs = std::filesystem;
+
 static void companion(int fd) {
 
-    std::vector<uint8_t> dex, json;
+    uint32_t size = 0;
+    xread(fd, &size, sizeof(size));
 
-    if (std::filesystem::exists(DEX_PATH)) {
-        dex = readFile(DEX_PATH);
+    std::string gmsDir(size, '\0');
+
+    xread(fd, &gmsDir[0], size);
+
+    LOGD("[ROOT] GMS dir: %s", gmsDir.c_str());
+
+    std::string PIF_PATH = "/data/adb/modules/playintegrityfix";
+
+    std::string DEX_FILE = PIF_PATH + "/classes.dex";
+    std::string NEW_DEX_FILE = gmsDir + "/classes.dex";
+
+    std::string JSON_FILE = "/data/adb/pif.json";
+    std::string JSON_FILE_2 = PIF_PATH + "/custom.pif.json";
+    std::string JSON_FILE_DEFAULT = PIF_PATH + "/pif.json";
+    std::string NEW_JSON_FILE = gmsDir + "/pif.json";
+
+    std::string SHADOWHOOK_DIR;
+
+#if __aarch64__
+    SHADOWHOOK_DIR = PIF_PATH + "/shadowhook/arm64-v8a";
+#elif __arm__
+    SHADOWHOOK_DIR = PIF_PATH + "/shadowhook/armeabi-v7a";
+#endif
+
+    if (fs::exists(DEX_FILE)) {
+        if (fs::copy_file(DEX_FILE, NEW_DEX_FILE,
+                          fs::copy_options::overwrite_existing)) {
+            fs::permissions(NEW_DEX_FILE, fs::perms::owner_read |
+                                          fs::perms::group_read |
+                                          fs::perms::others_read);
+        }
     }
 
-    if (std::filesystem::exists(PIF_JSON)) {
-        json = readFile(PIF_JSON);
-    } else if (std::filesystem::exists(PIF_JSON_DEFAULT)) {
-        json = readFile(PIF_JSON_DEFAULT);
+    bool copy = false;
+
+    if (fs::exists(JSON_FILE)) {
+        copy = fs::copy_file(JSON_FILE, NEW_JSON_FILE,
+                             fs::copy_options::overwrite_existing);
+    } else if (fs::exists(JSON_FILE_2)) {
+        copy = fs::copy_file(JSON_FILE_2, NEW_JSON_FILE,
+                             fs::copy_options::overwrite_existing);
+    } else if (fs::exists(JSON_FILE_DEFAULT)) {
+        copy = fs::copy_file(JSON_FILE_DEFAULT, NEW_JSON_FILE,
+                             fs::copy_options::overwrite_existing);
     }
 
-    int dexSize = static_cast<int>(dex.size());
-    int jsonSize = static_cast<int>(json.size());
-
-    xwrite(fd, &dexSize, sizeof(dexSize));
-    xwrite(fd, &jsonSize, sizeof(jsonSize));
-
-    if (dexSize > 0) {
-        xwrite(fd, dex.data(), dexSize * sizeof(uint8_t));
+    if (copy) {
+        fs::permissions(NEW_JSON_FILE, fs::perms::all);
     }
 
-    if (jsonSize > 0) {
-        xwrite(fd, json.data(), jsonSize * sizeof(uint8_t));
+    if (fs::exists(SHADOWHOOK_DIR)) {
+        for (const auto &entry: fs::directory_iterator(SHADOWHOOK_DIR)) {
+            if (fs::is_regular_file(entry.status())) {
+                fs::path targetPath = gmsDir / entry.path().filename();
+                fs::copy_file(entry.path(), targetPath,
+                              fs::copy_options::overwrite_existing);
+            }
+        }
     }
 
-    std::string ts(TS_PATH);
-    bool trickyStore = std::filesystem::exists(ts) &&
-                       !std::filesystem::exists(ts + "/disable") &&
-                       !std::filesystem::exists(ts + "/remove");
+    std::string ts("/data/adb/modules/tricky_store");
+    bool trickyStore = fs::exists(ts) && !fs::exists(ts + "/disable") &&
+                       !fs::exists(ts + "/remove");
     xwrite(fd, &trickyStore, sizeof(trickyStore));
 
     bool testSignedRom = checkOtaZip();

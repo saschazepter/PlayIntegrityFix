@@ -2,10 +2,12 @@
 agp = "8.7.3"
 cxx = "27.0.12077973"
 hiddenapibypass = "4.3"
+shadowhook = "1.1.1"
 
 [libraries]
 cxx = { group = "org.lsposed.libcxx", name = "libcxx", version.ref = "cxx" }
 hiddenapibypass = { group = "org.lsposed.hiddenapibypass", name = "hiddenapibypass", version.ref = "hiddenapibypass" }
+shadowhook = { group = "com.bytedance.android", name = "shadowhook", version.ref = "shadowhook" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

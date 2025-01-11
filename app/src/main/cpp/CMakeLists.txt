@@ -8,6 +8,6 @@ link_libraries(cxx::cxx)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED main.cpp)
 
-add_subdirectory(Dobby)
+find_package(shadowhook REQUIRED CONFIG)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE log dobby_static)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE log shadowhook::shadowhook)
