@@ -52,14 +52,15 @@ fi
 
 set_random_beta() {
 	if [ "$(echo "$MODEL_LIST" | wc -l)" -ne "$(echo "$PRODUCT_LIST" | wc -l)" ]; then
-		echo "Error: MODEL_LIST and PRODUCT_LIST have different lengths."
-		sleep_pause
-		exit 1
+		echo "Warning: MODEL_LIST and PRODUCT_LIST have different lengths, using Pixel 6 fallback"
+		MODEL="Pixel 6"
+		PRODUCT="oriole_beta"
+	else
+		count=$(echo "$MODEL_LIST" | wc -l)
+		rand_index=$(( $$ % count ))
+		MODEL=$(echo "$MODEL_LIST" | sed -n "$((rand_index + 1))p")
+		PRODUCT=$(echo "$PRODUCT_LIST" | sed -n "$((rand_index + 1))p")
 	fi
-	count=$(echo "$MODEL_LIST" | wc -l)
-	rand_index=$(( $$ % count ))
-	MODEL=$(echo "$MODEL_LIST" | sed -n "$((rand_index + 1))p")
-	PRODUCT=$(echo "$PRODUCT_LIST" | sed -n "$((rand_index + 1))p")
 }
 
 # Get latest Pixel Beta information
@@ -82,7 +83,7 @@ download "$OTA_URL" PIXEL_OTA_HTML
 
 # Extract device information
 MODEL_LIST="$(grep -A1 'tr id=' PIXEL_OTA_HTML | grep 'td' | sed 's;.*<td>\(.*\)</td>;\1;')"
-PRODUCT_LIST="$(grep -o 'ota/.*_beta' PIXEL_OTA_HTML | cut -d\/ -f2)"
+PRODUCT_LIST="$(grep -o 'tr id="[^"]*"' PIXEL_OTA_HTML | awk -F\" '{print $2 "_beta"}')"
 OTA_LIST="$(grep 'ota/.*_beta' PIXEL_OTA_HTML | cut -d\" -f2)"
 
 # Select and configure device
